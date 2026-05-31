@@ -8,6 +8,7 @@ import { findDuplicate } from "@/lib/dedup";
 import { fetchFromRss } from "@/lib/batch/fetchers/rss";
 import { fetchFromSitemap } from "@/lib/batch/fetchers/sitemap";
 import { fetchFromHtml } from "@/lib/batch/fetchers/html";
+import { fetchFromGoogleNews } from "@/lib/batch/fetchers/googleNews";
 import { discoverFeedUrl } from "@/lib/batch/discover";
 import { extractArticle, mergeCandidate } from "@/lib/batch/extract";
 import { dailyWindow, backfillWindow, type TimeWindow } from "@/lib/batch/window";
@@ -154,31 +155,102 @@ async function collectCandidates(
   source: Source,
   tw: TimeWindow
 ): Promise<ArticleCandidate[]> {
+  const primary = await tryPrimary(source, tw);
+  if (primary.candidates.length > 0) return primary.candidates;
+
+  // Fallback: ask Google News for anything it indexed under this site's
+  // domain. Triggers when the configured strategy returned nothing (site
+  // blocked us, parser couldn't find items, etc.).
+  try {
+    const gn = await fetchFromGoogleNews(
+      source.homepageUrl,
+      source.defaultLanguage
+    );
+    if (gn.candidates.length > 0) {
+      logger.info(
+        { source: source.name, count: gn.candidates.length },
+        "google news fallback recovered candidates"
+      );
+      return gn.candidates;
+    }
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, source: source.name },
+      "google news fallback failed"
+    );
+  }
+
+  // Nothing worked. If the primary strategy threw a technical error, propagate
+  // it so the batch run records the failure (preserves admin visibility).
+  // Otherwise return [] — the feed is just empty for this window.
+  if (primary.error) throw primary.error;
+  return [];
+}
+
+interface PrimaryResult {
+  candidates: ArticleCandidate[];
+  /** Last error from a strategy attempt, if any (kept to re-throw when GN also fails). */
+  error?: Error;
+}
+
+/**
+ * Run the configured fetch strategy. Catches per-strategy errors so the
+ * Google News fallback gets a chance, but remembers the last error so we
+ * can re-throw it when the fallback also returns nothing.
+ */
+async function tryPrimary(
+  source: Source,
+  tw: TimeWindow
+): Promise<PrimaryResult> {
   const strategy = source.fetchStrategy;
+  let lastError: Error | undefined;
+  const safe = async (
+    fn: () => Promise<FetcherResult>,
+    label: string
+  ): Promise<ArticleCandidate[]> => {
+    try {
+      return (await fn()).candidates;
+    } catch (err) {
+      lastError = err as Error;
+      logger.warn(
+        { err: lastError.message, source: source.name, label },
+        "primary strategy failed"
+      );
+      return [];
+    }
+  };
 
   if (strategy === "rss" || (strategy === "auto" && source.feedUrl)) {
-    if (source.feedUrl) return (await fetchFromRss(source.feedUrl)).candidates;
-  }
-  if (strategy === "sitemap" || (strategy === "auto" && source.sitemapUrl)) {
-    if (source.sitemapUrl)
-      return (await fetchFromSitemap(source.sitemapUrl, tw.since)).candidates;
-  }
-
-  if (strategy === "auto") {
-    const discovered = await discoverFeedUrl(source.homepageUrl);
-    if (discovered) {
-      await prisma.source.update({
-        where: { id: source.id },
-        data: { feedUrl: discovered },
-      });
-      logger.info({ source: source.name, feedUrl: discovered }, "discovered feed");
-      return (await fetchFromRss(discovered)).candidates;
+    if (source.feedUrl) {
+      const c = await safe(() => fetchFromRss(source.feedUrl!), "rss");
+      if (c.length > 0 || strategy === "rss") return { candidates: c, error: lastError };
     }
   }
-
-  // Last resort: scrape homepage HTML.
-  const r: FetcherResult = await fetchFromHtml(source.homepageUrl);
-  return r.candidates;
+  if (strategy === "sitemap" || (strategy === "auto" && source.sitemapUrl)) {
+    if (source.sitemapUrl) {
+      const c = await safe(
+        () => fetchFromSitemap(source.sitemapUrl!, tw.since),
+        "sitemap"
+      );
+      if (c.length > 0 || strategy === "sitemap") return { candidates: c, error: lastError };
+    }
+  }
+  if (strategy === "auto") {
+    const discovered = await discoverFeedUrl(source.homepageUrl).catch(() => null);
+    if (discovered) {
+      await prisma.source
+        .update({ where: { id: source.id }, data: { feedUrl: discovered } })
+        .catch(() => undefined);
+      logger.info({ source: source.name, feedUrl: discovered }, "discovered feed");
+      const c = await safe(() => fetchFromRss(discovered), "discovered-rss");
+      if (c.length > 0) return { candidates: c, error: lastError };
+    }
+  }
+  if (strategy === "html" || strategy === "auto") {
+    const c = await safe(() => fetchFromHtml(source.homepageUrl), "html");
+    return { candidates: c, error: lastError };
+  }
+  return { candidates: [], error: lastError };
 }
 
 async function enrich(
